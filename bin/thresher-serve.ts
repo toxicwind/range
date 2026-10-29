@@ -13,12 +13,43 @@
 import { existsSync, chmodSync, readFileSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 
-// 2026-10-28: /home/toxic/estate is a FORBIDDEN ghost path (estate single-truth
-// lease — see AGENTS.md rule: /home/toxic/estate must NOT exist in any form).
-// The SSOT config lives in the estate control plane at pens/estate/ranch/thresher/.
-const ESTATE = '/home/toxic/pens/estate'
-const CFG = `${ESTATE}/ranch/thresher/mcp_config.json`
-const DIST = `${ESTATE}/ranch/thresher/mcp_config.json.dist`
+// 2026-10-29: resolve thresher's product home the way the bin contract demands —
+// through the estate-ops manifest (the canary) and pens walking, NEVER a
+// hardcoded product path. (The old literal pointed at the forbidden ghost
+// estate/ranch/thresher, then at pens/estate/ranch/thresher, and broke on every
+// reorg — that is exactly what the manifest exists to prevent.)
+const PENS = '/home/toxic/pens'
+
+function resolveThresherHome(): string {
+  // 1) manifest: any thresher-* target reveals the product home
+  try {
+    const manifest = readFileSync(
+      `${PENS}/barn/estate-ops/bin/manifest.yaml`,
+      'utf8'
+    )
+    const re = new RegExp(`target: "[^"]*(${PENS}/[a-z]+/thresher)/`)
+    const m = manifest.match(re)
+    if (m?.[1]) return m[1]
+  } catch {
+    // manifest missing — fall through to pens walk
+  }
+  // 2) pens walk: first pen holding a thresher/ checkout with a binary or config
+  for (const pen of ['barn', 'ranch']) {
+    const home = `${PENS}/${pen}/thresher`
+    if (
+      existsSync(`${home}/mcp_config.json`) ||
+      existsSync(`${home}/bin/thresher`)
+    )
+      return home
+  }
+  throw new Error(
+    'thresher home not resolvable: no manifest entry, no pens checkout'
+  )
+}
+
+const THRESHER = resolveThresherHome()
+const CFG = `${THRESHER}/mcp_config.json`
+const DIST = `${THRESHER}/mcp_config.json.dist`
 
 /**
  * Resolve a secret from the keyring via `secretsmith get --label X --show`.
@@ -31,8 +62,17 @@ function secret(key: string): string | undefined {
   // The thresher management key is stored as THRESHER_API_KEY (anomaly #16:
   // --app exact-match; service attrs are unreliable — filter by label only).
   const label = key === 'MCPPROXY_API_KEY' ? 'THRESHER_API_KEY' : key
-  for (const l of [label, ...(label.startsWith('THRESHER') ? [] : ['THRESHER_' + label.replace(/_API_KEY$/, '')])]) {
-    const sm = spawnSync('/home/toxic/.local/bin/secretsmith', ['get', '--label', l, '--show'], { encoding: 'utf8' })
+  for (const l of [
+    label,
+    ...(label.startsWith('THRESHER')
+      ? []
+      : ['THRESHER_' + label.replace(/_API_KEY$/, '')]),
+  ]) {
+    const sm = spawnSync(
+      '/home/toxic/.local/bin/secretsmith',
+      ['get', '--label', l, '--show'],
+      { encoding: 'utf8' }
+    )
     if (sm.status === 0) {
       const line = sm.stdout.match(/^secret: (.+)$/m)
       if (line) return line[1]
@@ -95,16 +135,20 @@ try {
     chmodSync(CFG, 0o600)
   }
 } catch (e) {
-  console.error('thresher-serve: could not sync config api_key to secretsmith:', e)
+  console.error(
+    'thresher-serve: could not sync config api_key to secretsmith:',
+    e
+  )
 }
 
 // thresher is the estate's own fork of mcpproxy-go. Its `serve` entrypoint is
 // the Go gateway binary at ./cmd/mcpproxy, built directly from the module root
-// (pens/ranch/thresher) — no vendored upstream clone. Rebuild with build.sh.
-const THRESHER_BIN = '/home/toxic/pens/ranch/thresher/bin/thresher'
+// (the resolved thresher home, currently pens/barn/thresher) — no vendored
+// upstream clone. Rebuild with build.sh in the product home.
+const THRESHER_BIN = `${THRESHER}/bin/thresher`
 if (!existsSync(THRESHER_BIN)) {
   console.error('thresher (fork of mcpproxy-go) binary missing:')
-  console.error('  run: /home/toxic/pens/ranch/thresher/build.sh')
+  console.error(`  run: ${THRESHER}/build.sh`)
   process.exit(1)
 }
 
