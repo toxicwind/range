@@ -27,20 +27,27 @@ function resolveThresherHome(): string {
       `${PENS}/barn/estate-ops/bin/manifest.yaml`,
       'utf8'
     )
-    const re = new RegExp(`target: "[^"]*(${PENS}/[a-z]+/thresher)/`)
+    const re = new RegExp(
+      `target: "[^"]*(${PENS}/[a-z]+/(?:products/)?thresher)/`
+    )
     const m = manifest.match(re)
     if (m?.[1]) return m[1]
   } catch {
     // manifest missing — fall through to pens walk
   }
   // 2) pens walk: first pen holding a thresher/ checkout with a binary or config
+  // (products/ layout after the 2026-10-29 pen normalization, then legacy root)
   for (const pen of ['barn', 'ranch']) {
-    const home = `${PENS}/${pen}/thresher`
-    if (
-      existsSync(`${home}/mcp_config.json`) ||
-      existsSync(`${home}/bin/thresher`)
-    )
-      return home
+    for (const home of [
+      `${PENS}/${pen}/products/thresher`,
+      `${PENS}/${pen}/thresher`,
+    ]) {
+      if (
+        existsSync(`${home}/mcp_config.json`) ||
+        existsSync(`${home}/bin/thresher`)
+      )
+        return home
+    }
   }
   throw new Error(
     'thresher home not resolvable: no manifest entry, no pens checkout'
