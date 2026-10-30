@@ -1,4 +1,8 @@
 {
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "bun-types": "^1.4.4"
+  },
   "name": "@next/swc-win32-x64-msvc",
   "version": "0.0.0",
   "repository": {

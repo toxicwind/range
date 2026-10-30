@@ -1,0 +1,14 @@
+{
+  "name": "bench-recursive-delete",
+  "type": "module",
+  "scripts": {
+    "bench": "bash run.sh"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "bun-types": "^1.4.4",
+    "fuzzponent": "workspace:*",
+    "next": "workspace:*",
+    "rimraf": "6.0.1"
+  }
+}
