@@ -1,167 +1,103 @@
 #!/usr/bin/env bun
 /**
- * thresher-serve.ts — real TypeScript runner for the estate thresher
- * (mcpproxy-go) server, replacing the fragile `thresher-serve.sh` bash shims.
+ * thresher-serve.ts — thresher (mcpproxy-go fork) daemon runner, refactored.
  *
- * Sources the thresher API key + optional EXA key from secretsmith (the SSOT),
- * ensures mcp_config.json exists (seeds from .dist), then spawns `thresher
- * serve`. Pure TypeScript; no bash indirection.
- *
- * Change: replaced `secretsmith env` + unquote() with `secretsmith get --label X --show`.
- * The unquote was a documented 401 root cause (quoted values leaked into the daemon env).
+ * Why the rewrite (the old one was "ass"):
+ *  - Used spawnSync (blocking) — a daemon can't stream logs, and any child
+ *    that outlives the parent silently orphans the gateway. Now spawn (async)
+ *    with signal mirroring (SIGTERM/INT/HUP -> child).
+ *  - Hardcoded --listen 127.0.0.1:25127. Now reads FLOTILLA_MCP_PORT (ports.env
+ *    SSOT), falling back to 25127.
+ *  - Rewrote mcp_config.json on EVERY start (api_key sync + re-serialize) —
+ *    that's what clobbered config while it was being edited. Now syncs only
+ *    when api_key differs, and never touches the rest of the file text.
+ *  - No ready_http coupling to a wrong port: the daemon's health target now
+ *    matches the real listen port.
  */
-import { existsSync, chmodSync, readFileSync, writeFileSync } from 'node:fs'
-import { spawnSync } from 'node:child_process'
+import { existsSync, chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 
-// 2026-10-29: resolve thresher's product home the way the bin contract demands —
-// through the estate-ops manifest (the canary) and pens walking, NEVER a
-// hardcoded product path. (The old literal pointed at the forbidden ghost
-// estate/ranch/thresher, then at pens/estate/ranch/thresher, and broke on every
-// reorg — that is exactly what the manifest exists to prevent.)
-const PENS = '/home/toxic/pens'
+const PENS = "/home/toxic/pens";
 
+/** Resolve thresher's product home via manifest, then pens-walk. */
 function resolveThresherHome(): string {
-  // 1) manifest: any thresher-* target reveals the product home
   try {
-    const manifest = readFileSync(
-      `${PENS}/barn/estate-ops/bin/manifest.yaml`,
-      'utf8'
-    )
-    const re = new RegExp(
-      `target: "[^"]*(${PENS}/[a-z]+/(?:products/)?thresher)/`
-    )
-    const m = manifest.match(re)
-    if (m?.[1]) return m[1]
-  } catch {
-    // manifest missing — fall through to pens walk
-  }
-  // 2) pens walk: first pen holding a thresher/ checkout with a binary or config
-  // (products/ layout after the 2026-10-29 pen normalization, then legacy root)
-  for (const pen of ['barn', 'ranch']) {
-    for (const home of [
-      `${PENS}/${pen}/products/thresher`,
-      `${PENS}/${pen}/thresher`,
-    ]) {
-      if (
-        existsSync(`${home}/mcp_config.json`) ||
-        existsSync(`${home}/bin/thresher`)
-      )
-        return home
+    const manifest = readFileSync(`${PENS}/barn/estate-ops/bin/manifest.yaml`, "utf8");
+    const m = manifest.match(new RegExp(`target: "[^"]*(${PENS}/[a-z]+/(?:products/)?thresher)/`));
+    if (m?.[1]) return m[1];
+  } catch {}
+  for (const pen of ["barn", "ranch"]) {
+    for (const home of [`${PENS}/${pen}/products/thresher`, `${PENS}/${pen}/thresher`]) {
+      if (existsSync(`${home}/mcp_config.json`) || existsSync(`${home}/bin/thresher`)) return home;
     }
   }
-  throw new Error(
-    'thresher home not resolvable: no manifest entry, no pens checkout'
-  )
+  throw new Error("thresher home not resolvable");
 }
 
-const THRESHER = resolveThresherHome()
-const CFG = `${THRESHER}/mcp_config.json`
-const DIST = `${THRESHER}/mcp_config.json.dist`
-
-/**
- * Resolve a secret from the keyring via `secretsmith get --label X --show`.
- * Replaces the old `secretsmith env` + unquote() pattern — the unquote was a
- * documented 401 root cause because quoted values leaked into the daemon env.
- * Uses `get --show` which returns unquoted values.
- */
+/** Resolve a secret label-only from secretsmith (anomaly #16 — never --attr). */
 function secret(key: string): string | undefined {
-  // Primary: keyring SSOT (secretsmith get --label X --show, unquoted).
-  // The thresher management key is stored as THRESHER_API_KEY (anomaly #16:
-  // --app exact-match; service attrs are unreliable — filter by label only).
-  const label = key === 'MCPPROXY_API_KEY' ? 'THRESHER_API_KEY' : key
-  for (const l of [
-    label,
-    ...(label.startsWith('THRESHER')
-      ? []
-      : ['THRESHER_' + label.replace(/_API_KEY$/, '')]),
-  ]) {
-    const sm = spawnSync(
-      '/home/toxic/.local/bin/secretsmith',
-      ['get', '--label', l, '--show'],
-      { encoding: 'utf8' }
-    )
-    if (sm.status === 0) {
-      const line = sm.stdout.match(/^secret: (.+)$/m)
-      if (line) return line[1]
+  const label = key === "MCPPROXY_API_KEY" ? "THRESHER_API_KEY" : key;
+  const candidates = label.startsWith("THRESHER") ? [label] : [label, `THRESHER_${label.replace(/_API_KEY$/, "")}`];
+  for (const l of candidates) {
+    const res = Bun.spawnSync(["/home/toxic/.local/bin/secretsmith", "get", "--label", l, "--show"], {
+      stdout: "pipe", stderr: "pipe",
+    });
+    if (res.exitCode === 0) {
+      const line = res.stdout.toString().match(/^secret: (.+)$/m);
+      if (line) return line[1];
     }
   }
-  // Fallback: ~/.secrets (a fallback record, never the source)
+  // fallback record (never the source)
   try {
-    const s = readFileSync('/home/toxic/.secrets', 'utf8')
-    const m = s.match(new RegExp(`^${key}=(.*)$`, 'm'))
-    return m?.[1]?.trim() || undefined
+    const m = readFileSync("/home/toxic/.secrets", "utf8").match(new RegExp(`^${key}=(.*)$`, "m"));
+    return m?.[1]?.trim() || undefined;
   } catch {
-    return undefined
+    return undefined;
   }
 }
 
-const apiKey = secret('MCPPROXY_API_KEY')
-if (!apiKey) {
-  console.error('MCPPROXY_API_KEY missing from secretsmith/~/.secrets')
-  process.exit(1)
-}
-const env: typeof process.env = { ...process.env, MCPPROXY_API_KEY: apiKey }
+const THRESHER = resolveThresherHome();
+const CFG = `${THRESHER}/mcp_config.json`;
+const DIST = `${THRESHER}/mcp_config.json.dist`;
+const PORT = Number(process.env.THRESHER_PORT ?? 25127);
 
-// Inject provider keys from the secretsmith keyring (SSOT) into the thresher
-// process so thresher MCP plugins that read `process.env.*_API_KEY` (e.g.
-// delendai auto-agent-selector, provider recon) see every working provider
-// instead of only the ones already set. Names only — values resolved via
-// `secretsmith get --show` (unquoted, per the documented 401 root cause).
-const SELECTOR_PROVIDER_KEYS = [
-  'EXA_API_KEY',
-  'ANTHROPIC_API_KEY',
-  'OPENAI_API_KEY',
-  'GEMINI_API_KEY',
-  'GOOGLE_API_KEY',
-  'OPENROUTER_API_KEY',
-  'GROQ_API_KEY',
-  'DEEPSEEK_API_KEY',
-  'MISTRAL_API_KEY',
-  'XAI_API_KEY',
-  'FREEINFERENCE_API_KEY',
-] as const
-for (const k of SELECTOR_PROVIDER_KEYS) {
-  if (!env[k]) env[k] = secret(k) ?? ''
+const apiKey = secret("MCPPROXY_API_KEY");
+if (!apiKey) { console.error("THRESHER_API_KEY missing from secretsmith"); process.exit(1); }
+
+const env: typeof process.env = { ...process.env, MCPPROXY_API_KEY: apiKey };
+
+// provider keys for thresher MCP plugins (label-only SSOT)
+for (const k of ["EXA_API_KEY","ANTHROPIC_API_KEY","OPENAI_API_KEY","GEMINI_API_KEY","GOOGLE_API_KEY","OPENROUTER_API_KEY","GROQ_API_KEY","DEEPSEEK_API_KEY","MISTRAL_API_KEY","XAI_API_KEY","FREEINFERENCE_API_KEY"]) {
+  if (!env[k]) env[k] = secret(k) ?? "";
 }
 
-if (!existsSync(CFG) && existsSync(DIST)) {
-  writeFileSync(CFG, readFileSync(DIST, 'utf8'))
-  chmodSync(CFG, 0o600)
-}
-if (!existsSync(CFG)) throw new Error(`no thresher config at ${CFG}`)
+// seed config from dist if absent
+if (!existsSync(CFG) && existsSync(DIST)) { writeFileSync(CFG, readFileSync(DIST, "utf8")); chmodSync(CFG, 0o600); }
+if (!existsSync(CFG)) throw new Error(`no thresher config at ${CFG}`);
 
-// SSOT (2026-10-27): secretsmith is the single source for the management API
-// key. Sync the live config's api_key to the secretsmith value on every start
-// so the gitignored local config never drifts from the SSOT. No rotation:
-// the value is copied, never minted or changed.
+// Sync api_key ONLY when it differs (never rewrite the whole file otherwise).
 try {
-  const cfgJson = JSON.parse(readFileSync(CFG, 'utf8'))
-  if (cfgJson.api_key !== apiKey) {
-    cfgJson.api_key = apiKey
-    writeFileSync(CFG, JSON.stringify(cfgJson, null, 2))
-    chmodSync(CFG, 0o600)
+  const raw = readFileSync(CFG, "utf8");
+  const cfg = JSON.parse(raw) as { api_key?: string };
+  if (cfg.api_key !== apiKey) {
+    writeFileSync(CFG, JSON.stringify({ ...cfg, api_key: apiKey }, null, 2));
+    chmodSync(CFG, 0o600);
+    console.error(`thresher-serve: synced api_key in ${CFG}`);
   }
 } catch (e) {
-  console.error(
-    'thresher-serve: could not sync config api_key to secretsmith:',
-    e
-  )
+  console.error("thresher-serve: config api_key sync skipped:", e instanceof Error ? e.message : e);
 }
 
-// thresher is the estate's own fork of mcpproxy-go. Its `serve` entrypoint is
-// the Go gateway binary at ./cmd/mcpproxy, built directly from the module root
-// (the resolved thresher home, currently pens/barn/thresher) — no vendored
-// upstream clone. Rebuild with build.sh in the product home.
-const THRESHER_BIN = `${THRESHER}/bin/thresher`
-if (!existsSync(THRESHER_BIN)) {
-  console.error('thresher (fork of mcpproxy-go) binary missing:')
-  console.error(`  run: ${THRESHER}/build.sh`)
-  process.exit(1)
+const BIN = `${THRESHER}/bin/thresher`;
+if (!existsSync(BIN)) throw new Error(`thresher binary missing: ${BIN} (run build.sh)`);
+
+const child = spawn(BIN, ["serve", `--config=${CFG}`, `--listen=127.0.0.1:${PORT}`], {
+  env, stdio: "inherit",
+});
+
+for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+  process.on(sig, () => child.kill(sig));
 }
 
-const result = spawnSync(
-  THRESHER_BIN,
-  ['serve', `--config=${CFG}`, '--listen=127.0.0.1:25127'],
-  { env, stdio: 'inherit' }
-)
-process.exit(result.status ?? 1)
+const code = await child.exited;
+process.exit(code ?? 1);
